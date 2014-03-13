@@ -6,12 +6,44 @@ Created on 2014-3-10
 @author: Deckmon
 '''
 
+import json
 import types
 from random import Random
 from time import time as ttime
+from collections import defaultdict
+from xml.etree import cElementTree as ET
+from urllib import urlopen
 
 from hashcompat import md5_constructor as md5, sha_constructor as sha1
 from config import settings
+
+DELIVER_NOTIFY_URL = "https://api.weixin.qq.com/pay/delivernotify"
+
+
+def etree_to_dict(t):
+    d = {t.tag: {} if t.attrib else None}
+    children = list(t)
+    if children:
+        dd = defaultdict(list)
+        for dc in map(etree_to_dict, children):
+            for k, v in dc.iteritems():
+                dd[k].append(v)
+        d = {t.tag: {k:v[0] if len(v) == 1 else v for k, v in dd.iteritems()}}
+    if t.attrib:
+        d[t.tag].update(('@' + k, v) for k, v in t.attrib.iteritems())
+    if t.text:
+        text = t.text.strip()
+        if children or t.attrib:
+            if text:
+              d[t.tag]['#text'] = text
+        else:
+            d[t.tag] = text
+    return d
+
+
+def xml_to_dict(xml_text):
+    e = ET.XML(smart_str(xml_text))
+    return etree_to_dict(e)
 
 
 always_safe = ('ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -99,7 +131,7 @@ def smart_str(s, encoding='utf-8', strings_only=False, errors='strict'):
         return s
 
 
-def params_filter(params):
+def params_filter(params, except_keys=[]):
     # 对数组排序并除去数组中的空值和签名参数
     # 返回数组和链接串
     ks = params.keys()
@@ -109,7 +141,7 @@ def params_filter(params):
     for k in ks:
         v = params[k]
         k = smart_str(k, settings.INPUT_CHARSET)
-        if v != '':
+        if k not in except_keys and v != '':
             newparams[k] = smart_str(v, settings.INPUT_CHARSET)
             prestr += '%s=%s&' % (k, newparams[k])
     prestr = prestr[:-1]
@@ -139,6 +171,7 @@ def build_mysign(prestr, key, sign_type='MD5'):
 
 
 def get_brand_wc_pay_request(body, out_trade_no, total_fee, ip, attach=""):
+    # total_fee 为字符串，单位是分
     params = {}
     params["appId"] = settings.WXPAY_APPID
     params["timeStamp"] = "%.f" % ttime()
@@ -180,3 +213,60 @@ def get_brand_wc_pay_request(body, out_trade_no, total_fee, ip, attach=""):
     params["signType"] = "SHA1"
     params["paySign"] = pay_sign
     return params
+
+
+def parse_notify_body(body):
+    return xml_to_dict(body)["xml"]
+
+
+def verify_get(get):
+    _,prestr = params_filter(get, except_keys=["sign"])    
+    mysign = build_mysign(prestr, settings.WXPAY_PARTNERKEY, sign_type = "MD5").upper()
+    if mysign != get.get('sign'):
+        return False
+    return True
+
+
+def verify_post(post_data):
+    if not isinstance(post_data, dict):
+        post_data = parse_notify_body(post_data)
+
+    lower_params = {}
+    for key in post_data:
+        lower_params[key.lower()] = post_data[key]
+    lower_params["appkey"] = settings.WXPAY_PAYSIGNKEY
+    lower_params.pop("signmethod", None)
+    app_signature = lower_params.pop("appsignature")
+    lower_params,lower_paramsprestr = params_filter(lower_params)
+    my_app_signature = sha1(lower_paramsprestr).hexdigest()
+
+    if my_app_signature != app_signature:
+        return False
+    return True
+
+
+def notify_verify(get, post_data):
+    return verify_get(get) and verify_post(post_data)
+
+
+def deliver_notify(access_token, openid, transid, out_trade_no):
+    url = DELIVER_NOTIFY_URL + "?access_token=" + access_token
+    payload = {
+        "appid": settings.WXPAY_APPID,
+        "openid": openid,
+        "transid": transid,
+        "out_trade_no": out_trade_no,
+        "deliver_timestamp": "%.f" % ttime(),
+        "deliver_status": "1",
+        "deliver_msg": "ok",
+
+    }
+    payload["appkey"] = settings.WXPAY_PAYSIGNKEY
+    payload,payloadprestr = params_filter(payload)
+    app_signature = sha1(payloadprestr).hexdigest()
+    del payload["appkey"]
+    payload["app_signature"] = app_signature
+    payload["sign_method"] = "sha1"
+    payload = json.dumps(payload)
+    res = json.loads(urlopen(url, payload).read())
+    return res
